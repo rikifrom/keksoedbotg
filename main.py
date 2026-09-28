@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import sys
-
+import time
 from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.filters import CommandStart
@@ -19,7 +19,7 @@ MODELS = [
     m.strip()
     for m in os.getenv(
         "GEMINI_MODELS",
-        "gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.8-flash",
+        "gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-2.5-flash-lite,gemini-2.5-flash,gemini-3.8-flash",
     ).split(",")
     if m.strip()
 ]
@@ -37,23 +37,31 @@ SYSTEM_PROMPT = """
 
 
 async def ask_gemini(prompt: str):
-    """Пробует модели по очереди. Возвращает текст или None, если все упали."""
-    for model in MODELS:
-        try:
-            # temperature не указываем: 3.5 Flash-Lite игнорирует кастомные значения.
-            response = await asyncio.wait_for(
-                client.aio.models.generate_content(
-                    model=model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
-                ),
-                timeout=20,
-            )
-            if response.text:
-                return response.text
-            logging.warning("Модель %s вернула пустой ответ, пробую следующую", model)
-        except Exception as e:
-            logging.warning("Модель %s не сработала: %s", model, e)
+    """Пробует модели по очереди, до 3 кругов (перегрузка 503 обычно временная).
+    Возвращает текст или None, если ничего не сработало за ~45 секунд."""
+    deadline = time.monotonic() + 45
+    for round_no in range(3):
+        for model in MODELS:
+            if time.monotonic() > deadline:
+                break
+            try:
+                # temperature не указываем: 3.5 Flash-Lite игнорирует кастомные значения.
+                response = await asyncio.wait_for(
+                    client.aio.models.generate_content(
+                        model=model,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+                    ),
+                    timeout=15,
+                )
+                if response.text:
+                    return response.text
+                logging.warning("Модель %s вернула пустой ответ, пробую следующую", model)
+            except Exception as e:
+                logging.warning("Круг %d, модель %s не сработала: %s", round_no + 1, model, e)
+        if time.monotonic() > deadline:
+            break
+        await asyncio.sleep(3)
     logging.error("Все модели недоступны: %s", MODELS)
     return None
 
