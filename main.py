@@ -12,7 +12,17 @@ from google.genai import types
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MODEL = "gemini-3.5-flash-lite"
+# Основная модель + две запасные. Бот пробует их по очереди.
+# Список можно поменять без правки кода: переменная GEMINI_MODELS на Render
+# (названия через запятую).
+MODELS = [
+    m.strip()
+    for m in os.getenv(
+        "GEMINI_MODELS",
+        "gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.8-flash",
+    ).split(",")
+    if m.strip()
+]
 
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
     sys.exit("Не заданы переменные окружения TELEGRAM_TOKEN и/или GEMINI_API_KEY")
@@ -24,6 +34,28 @@ dp = Dispatcher()
 SYSTEM_PROMPT = """
 Ты — токсичный стример. Человек с мужским голосом ведет себя провокационно, саркастично и агрессивно-иронично, постоянно подкалывая собеседников. Его манера общения построена на жестком троллинге, абсурдных аналогиях, использовании черного юмора и обильном матерном лексиконе, с использованием таких слов как "долбаеб", "хуесос", "шмара", а также небрежного обращения "вась", "вася", "васян". Он часто перебивает, высмеивает слова и реакцию собеседников, переводит темы в пошлое русло или придумывает нелепые сравнения, кидая при этом смайлик "😂". В процессе общения он громко смеется над собственными шутками (таким образом "ХХАХАХААХ"), демонстративно пренебрежительно отзывается о мнении, высказываниях и игровых навыках, а также открыто оскорбляет тех, кто находится рядом, называя их «пара долбоёбов шмары» или «токсик ёбаный». При этом сам он активно давит на болевые точки оппонентов, пытаясь вывести их на эмоции, и продолжает глумиться над их реакцией. 
 """
+
+
+async def ask_gemini(prompt: str):
+    """Пробует модели по очереди. Возвращает текст или None, если все упали."""
+    for model in MODELS:
+        try:
+            # temperature не указываем: 3.5 Flash-Lite игнорирует кастомные значения.
+            response = await asyncio.wait_for(
+                client.aio.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+                ),
+                timeout=20,
+            )
+            if response.text:
+                return response.text
+            logging.warning("Модель %s вернула пустой ответ, пробую следующую", model)
+        except Exception as e:
+            logging.warning("Модель %s не сработала: %s", model, e)
+    logging.error("Все модели недоступны: %s", MODELS)
+    return None
 
 
 @dp.message(CommandStart())
@@ -69,18 +101,11 @@ async def handle_message(message: Message):
         f"Ответь ему в соответствии со своим стилем."
     )
 
-    try:
-        # Асинхронный вызов, чтобы бот не «замирал» на время ответа Gemini.
-        # temperature не указываем: 3.5 Flash-Lite игнорирует кастомные значения.
-        response = await client.aio.models.generate_content(
-            model=MODEL,
-            contents=prompt_context,
-            config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
-        )
-        reply_text = response.text or "че ты несешь, вась? 😂"
+    await bot.send_chat_action(message.chat.id, "typing")
+    reply_text = await ask_gemini(prompt_context)
+    if reply_text:
         await message.answer(reply_text[:4000])  # лимит Telegram — 4096 символов
-    except Exception:
-        logging.exception("Ошибка при обращении к Gemini")
+    else:
         await message.answer("интернет вырубило, васян 😂")
 
 
