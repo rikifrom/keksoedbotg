@@ -69,7 +69,7 @@ async def handle_message(message: Message):
     try:
         # Запрос к Gemini с использованием модели gemini-2.5-flash и системной инструкции
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-3.8-flash',
             contents=prompt_context,
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
