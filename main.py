@@ -3,30 +3,31 @@ import logging
 import os
 import sys
 import time
-import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.filters import CommandStart
 from aiogram.types import Message
+from google import genai
+from google.genai import types
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-# Основная модель + запасная. Бот пробует их по очереди.
-# Список можно поменять без правки кода: переменная GROQ_MODELS на Render
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# Основная модель + две запасные. Бот пробует их по очереди.
+# Список можно поменять без правки кода: переменная GEMINI_MODELS на Render
 # (названия через запятую).
 MODELS = [
     m.strip()
     for m in os.getenv(
-        "GROQ_MODELS",
-        "llama-3.3-70b-versatile,llama-3.1-8b-instant",
+        "GEMINI_MODELS",
+        "gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-2.5-flash-lite,gemini-2.5-flash,gemini-3.8-flash",
     ).split(",")
     if m.strip()
 ]
 
-if not TELEGRAM_TOKEN or not GROQ_API_KEY:
-    sys.exit("Не заданы переменные окружения TELEGRAM_TOKEN и/или GROQ_API_KEY")
+if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
+    sys.exit("Не заданы переменные окружения TELEGRAM_TOKEN и/или GEMINI_API_KEY")
 
+client = genai.Client(api_key=GEMINI_API_KEY)
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
@@ -35,45 +36,32 @@ SYSTEM_PROMPT = """
 """
 
 
-async def ask_groq(prompt: str):
-    """Пробует модели по очереди, до 3 кругов (перегрузка/лимиты обычно временные).
+async def ask_gemini(prompt: str):
+    """Пробует модели по очереди, до 3 кругов (перегрузка 503 обычно временная).
     Возвращает текст или None, если ничего не сработало за ~45 секунд."""
     deadline = time.monotonic() + 45
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    async with aiohttp.ClientSession(headers=headers) as session:
-        for round_no in range(3):
-            for model in MODELS:
-                if time.monotonic() > deadline:
-                    break
-                try:
-                    payload = {
-                        "model": model,
-                        "messages": [
-                            {"role": "system", "content": SYSTEM_PROMPT},
-                            {"role": "user", "content": prompt},
-                        ],
-                    }
-                    async with session.post(
-                        GROQ_URL,
-                        json=payload,
-                        timeout=aiohttp.ClientTimeout(total=15),
-                    ) as resp:
-                        if resp.status != 200:
-                            body = await resp.text()
-                            raise RuntimeError(f"HTTP {resp.status}: {body[:200]}")
-                        data = await resp.json()
-                    text = data["choices"][0]["message"]["content"]
-                    if text:
-                        return text
-                    logging.warning("Модель %s вернула пустой ответ, пробую следующую", model)
-                except Exception as e:
-                    logging.warning("Круг %d, модель %s не сработала: %s", round_no + 1, model, e)
+    for round_no in range(3):
+        for model in MODELS:
             if time.monotonic() > deadline:
                 break
-            await asyncio.sleep(3)
+            try:
+                # temperature не указываем: 3.5 Flash-Lite игнорирует кастомные значения.
+                response = await asyncio.wait_for(
+                    client.aio.models.generate_content(
+                        model=model,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
+                    ),
+                    timeout=15,
+                )
+                if response.text:
+                    return response.text
+                logging.warning("Модель %s вернула пустой ответ, пробую следующую", model)
+            except Exception as e:
+                logging.warning("Круг %d, модель %s не сработала: %s", round_no + 1, model, e)
+        if time.monotonic() > deadline:
+            break
+        await asyncio.sleep(3)
     logging.error("Все модели недоступны: %s", MODELS)
     return None
 
@@ -122,7 +110,7 @@ async def handle_message(message: Message):
     )
 
     await bot.send_chat_action(message.chat.id, "typing")
-    reply_text = await ask_groq(prompt_context)
+    reply_text = await ask_gemini(prompt_context)
     if reply_text:
         await message.answer(reply_text[:4000])  # лимит Telegram — 4096 символов
     else:
