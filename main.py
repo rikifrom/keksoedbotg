@@ -68,7 +68,7 @@ async def ask_gemini(prompt: str):
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    await message.answer("че надо, вась? пиши нормально или отвали 😂")
+    await message.answer("че тебе нужно васян 😂")
 
 
 @dp.message()
