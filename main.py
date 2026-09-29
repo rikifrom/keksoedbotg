@@ -93,9 +93,54 @@ async def download_telegram_file(file_id: str) -> bytes:
     return buf.read()
 
 
+def extract_media_info(msg: Message):
+    """Достаёт из любого сообщения (текущего или процитированного) тип медиа,
+    file_id, mime-тип и (для аудио) название. Возвращает кортеж
+    (kind, file_id, mime, audio_title), где kind — "photo"/"voice"/"video_note"/
+    "audio"/None."""
+    if msg.photo:
+        return "photo", msg.photo[-1].file_id, "image/jpeg", None
+    if msg.voice:
+        return "voice", msg.voice.file_id, msg.voice.mime_type or "audio/ogg", None
+    if msg.video_note:
+        return "video_note", msg.video_note.file_id, "video/mp4", None
+    if msg.audio:
+        title = " - ".join(
+            filter(None, [msg.audio.performer, msg.audio.title])
+        ) or msg.audio.file_name
+        return "audio", msg.audio.file_id, msg.audio.mime_type or "audio/mpeg", title
+    if msg.document and (msg.document.mime_type or "").startswith("audio/"):
+        return (
+            "audio",
+            msg.document.file_id,
+            msg.document.mime_type or "audio/mpeg",
+            msg.document.file_name,
+        )
+    return None, None, None, None
+
+
+def content_description(kind, title, text) -> str:
+    """Человеко-читаемое описание содержимого сообщения для промпта."""
+    if kind == "photo":
+        return "фото" + (f' с подписью "{text}"' if text else "")
+    if kind == "voice":
+        return "голосовое сообщение"
+    if kind == "video_note":
+        return "видео-кружок"
+    if kind == "audio":
+        return (
+            "аудиофайл"
+            + (f' под названием "{title}"' if title else "")
+            + (f' с подписью "{text}"' if text else "")
+        )
+    if text:
+        return f'текст: "{text}"'
+    return "пустое сообщение"
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    await message.answer("че тебе нужно васян 😂")
+    await message.answer("че надо, вась? пиши нормально или отвали 😂")
 
 
 @dp.message()
@@ -107,27 +152,14 @@ async def handle_message(message: Message):
     text = message.text or message.caption or ""
     user = message.from_user
 
-    # Определяем, есть ли медиа: фото, голосовое или видео-кружок
-    media_kind = None  # "photo" | "voice" | "video_note"
-    media_file_id = None
-    media_mime = None
-    if message.photo:
-        media_kind = "photo"
-        media_file_id = message.photo[-1].file_id  # последнее — самое качественное
-        media_mime = "image/jpeg"
-    elif message.voice:
-        media_kind = "voice"
-        media_file_id = message.voice.file_id
-        media_mime = message.voice.mime_type or "audio/ogg"
-    elif message.video_note:
-        media_kind = "video_note"
-        media_file_id = message.video_note.file_id
-        media_mime = "video/mp4"
+    # Определяем, есть ли медиа: фото, голосовое, видео-кружок или аудиофайл (mp3 и т.п.)
+    media_kind, media_file_id, media_mime, audio_title = extract_media_info(message)
 
     media_labels = {
         "photo": "[фото]",
         "voice": "[голосовое сообщение]",
         "video_note": "[видео-кружок]",
+        "audio": f"[аудиофайл: {audio_title}]" if audio_title else "[аудиофайл]",
     }
 
     # Запоминаем сообщение в истории чата ещё до проверки на упоминание —
@@ -173,14 +205,36 @@ async def handle_message(message: Message):
     history_lines = list(chat_history[message.chat.id])[:-1]
     history_block = "\n".join(history_lines) if history_lines else "(переписки пока не было)"
 
-    media_descriptions = {
-        "photo": "прислал(а) фото" + (f' с подписью "{text}"' if text else ""),
-        "voice": "прислал(а) голосовое сообщение",
-        "video_note": "прислал(а) видео-кружок",
-    }
     what_happened = (
-        media_descriptions[media_kind] if media_kind else f'написал(а): "{text}"'
+        f"прислал(а) {content_description(media_kind, audio_title, text)}"
+        if media_kind
+        else content_description(None, None, text)
     )
+
+    # Если это ответ (реплай) на чьё-то сообщение — разбираем и его содержимое
+    # тоже, чтобы бот понимал, о чём именно спрашивает собеседник.
+    quoted = message.reply_to_message
+    quoted_block = ""
+    quoted_kind = quoted_file_id = quoted_mime = quoted_title = None
+    if quoted is not None:
+        quoted_text = quoted.text or quoted.caption or ""
+        quoted_kind, quoted_file_id, quoted_mime, quoted_title = extract_media_info(quoted)
+        if quoted.from_user and quoted.from_user.id == bot_user.id:
+            quoted_sender = "ты сам (бот) написал ранее"
+        elif quoted.from_user:
+            quoted_sender = (
+                f"{quoted.from_user.first_name or ''} {quoted.from_user.last_name or ''}".strip()
+                or quoted.from_user.username
+                or "кто-то"
+            )
+        else:
+            quoted_sender = "кто-то"
+        if quoted_kind or quoted_text:
+            quoted_desc = content_description(quoted_kind, quoted_title, quoted_text)
+            quoted_block = (
+                f"\nСобеседник ответил (сделал реплай) на сообщение, где {quoted_sender}: "
+                f"{quoted_desc}.\n"
+            )
 
     prompt_text = (
         f"Вот последние сообщения в чате для контекста (не отвечай на них напрямую, "
@@ -189,40 +243,46 @@ async def handle_message(message: Message):
         f"А теперь к тебе обратился собеседник:\n"
         f"- Имя в телеграм: {full_name}\n"
         f"- Юзернейм: @{username}\n"
-        f"- Собеседник {what_happened}\n\n"
-        f"Ответь именно на это, в своём стиле"
-        + (
-            ", посмотрев/прослушав приложенный файл"
-            if media_kind
-            else ""
-        )
-        + ", при необходимости учитывая контекст переписки выше."
+        f"- Собеседник {what_happened}\n"
+        f"{quoted_block}\n"
+        f"Ответь именно на текущее сообщение собеседника, в своём стиле"
+        + (", посмотрев/прослушав приложенные файлы" if (media_kind or quoted_kind) else "")
+        + ", учитывая при необходимости процитированное сообщение выше и контекст переписки."
     )
 
-    contents = prompt_text
-    media_error = None
+    # Собираем части запроса: собственное медиа, медиа из цитаты, затем текст.
+    parts = []
+    failure_notes = []
     if media_kind:
         try:
-            file_bytes = await download_telegram_file(media_file_id)
-            contents = [
-                types.Part.from_bytes(data=file_bytes, mime_type=media_mime),
-                prompt_text,
-            ]
+            own_bytes = await download_telegram_file(media_file_id)
+            parts.append(types.Part.from_bytes(data=own_bytes, mime_type=media_mime))
         except Exception as e:
             logging.warning("Не удалось скачать %s: %s", media_kind, e)
-            media_error = e
+            failure_notes.append("файл из текущего сообщения не загрузился")
+    if quoted_kind and quoted_file_id:
+        try:
+            quoted_bytes = await download_telegram_file(quoted_file_id)
+            parts.append(types.Part.from_bytes(data=quoted_bytes, mime_type=quoted_mime))
+        except Exception as e:
+            logging.warning("Не удалось скачать цитируемое %s: %s", quoted_kind, e)
+            failure_notes.append("файл из процитированного сообщения не загрузился")
 
-    action_map = {"photo": "upload_photo", "voice": "record_voice", "video_note": "upload_video"}
+    if failure_notes:
+        prompt_text += "\n(" + "; ".join(failure_notes) + " — отреагируй на это в своём стиле.)"
+
+    parts.append(prompt_text)
+    contents = parts if len(parts) > 1 else prompt_text
+
+    action_map = {
+        "photo": "upload_photo",
+        "voice": "record_voice",
+        "video_note": "upload_video",
+        "audio": "upload_document",
+    }
     await bot.send_chat_action(message.chat.id, action_map.get(media_kind, "typing"))
 
-    if media_kind and media_error is not None:
-        # Файл не скачался (например, больше 20 МБ) — отвечаем без него,
-        # но честно сообщаем модели, что содержимое недоступно.
-        reply_text = await ask_gemini(
-            prompt_text + "\n\n(Файл не удалось загрузить, отреагируй на это в своём стиле.)"
-        )
-    else:
-        reply_text = await ask_gemini(contents)
+    reply_text = await ask_gemini(contents)
     # message.reply вместо message.answer, чтобы в Telegram было видно цитату
     # сообщения, на которое отвечает бот — особенно важно в группах.
     if reply_text:
