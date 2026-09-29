@@ -93,6 +93,20 @@ async def download_telegram_file(file_id: str) -> bytes:
     return buf.read()
 
 
+async def get_avatar_bytes(user_id: int):
+    """Возвращает байты текущей аватарки пользователя или None, если её нет
+    либо у бота нет доступа (например, приватность профиля ограничена)."""
+    try:
+        photos = await bot.get_user_profile_photos(user_id, limit=1)
+        if photos.total_count == 0:
+            return None
+        file_id = photos.photos[0][-1].file_id  # самый качественный размер
+        return await download_telegram_file(file_id)
+    except Exception as e:
+        logging.warning("Не удалось получить аватарку %s: %s", user_id, e)
+        return None
+
+
 def extract_media_info(msg: Message):
     """Достаёт из любого сообщения (текущего или процитированного) тип медиа,
     file_id, mime-тип и (для аудио) название. Возвращает кортеж
@@ -201,6 +215,10 @@ async def handle_message(message: Message):
     full_name = f"{user.first_name or ''} {user.last_name or ''}".strip()
     username = user.username or "без юзернейма"
 
+    # Аватарку запрашиваем только сейчас, а не для каждого сообщения в истории —
+    # иначе на каждое сообщение в активном чате уходил бы лишний запрос к Telegram.
+    avatar_bytes = await get_avatar_bytes(user.id)
+
     # История чата без текущего сообщения (оно уже добавлено выше отдельной строкой)
     history_lines = list(chat_history[message.chat.id])[:-1]
     history_block = "\n".join(history_lines) if history_lines else "(переписки пока не было)"
@@ -244,9 +262,19 @@ async def handle_message(message: Message):
         f"- Имя в телеграм: {full_name}\n"
         f"- Юзернейм: @{username}\n"
         f"- Собеседник {what_happened}\n"
-        f"{quoted_block}\n"
-        f"Ответь именно на текущее сообщение собеседника, в своём стиле"
-        + (", посмотрев/прослушав приложенные файлы" if (media_kind or quoted_kind) else "")
+        f"{quoted_block}"
+        + (
+            "\nК сообщению приложена текущая аватарка собеседника из телеграма — "
+            "можешь при желании подколоть его внешний вид на ней.\n"
+            if avatar_bytes
+            else "\n"
+        )
+        + f"Ответь именно на текущее сообщение собеседника, в своём стиле"
+        + (
+            ", посмотрев/прослушав приложенные файлы"
+            if (media_kind or quoted_kind or avatar_bytes)
+            else ""
+        )
         + ", учитывая при необходимости процитированное сообщение выше и контекст переписки."
     )
 
@@ -267,6 +295,9 @@ async def handle_message(message: Message):
         except Exception as e:
             logging.warning("Не удалось скачать цитируемое %s: %s", quoted_kind, e)
             failure_notes.append("файл из процитированного сообщения не загрузился")
+
+    if avatar_bytes:
+        parts.append(types.Part.from_bytes(data=avatar_bytes, mime_type="image/jpeg"))
 
     if failure_notes:
         prompt_text += "\n(" + "; ".join(failure_notes) + " — отреагируй на это в своём стиле.)"
