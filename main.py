@@ -21,7 +21,7 @@ MODELS = [
     m.strip()
     for m in os.getenv(
         "GEMINI_MODELS",
-        "gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-2.5-flash-lite,gemini-2.5-flash,gemini-3.8-flash",
+        "gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.8-flash",
     ).split(",")
     if m.strip()
 ]
@@ -75,7 +75,25 @@ async def ask_gemini(contents):
                 )
                 if response.text:
                     return response.text
-                logging.warning("Модель %s вернула пустой ответ, пробую следующую", model)
+                # Пустой response.text обычно значит, что ответ заблокирован
+                # фильтрами безопасности Google, а не что что-то сломалось у нас.
+                # Логируем причину, чтобы это было видно в логах Render.
+                reason = None
+                try:
+                    if response.prompt_feedback and response.prompt_feedback.block_reason:
+                        reason = f"prompt_feedback.block_reason={response.prompt_feedback.block_reason}"
+                    elif response.candidates:
+                        cand = response.candidates[0]
+                        reason = f"finish_reason={cand.finish_reason}"
+                        if getattr(cand, "safety_ratings", None):
+                            reason += f", safety_ratings={cand.safety_ratings}"
+                except Exception:
+                    pass
+                logging.warning(
+                    "Модель %s вернула пустой ответ (%s), пробую следующую",
+                    model,
+                    reason or "причина неизвестна",
+                )
             except Exception as e:
                 logging.warning("Круг %d, модель %s не сработала: %s", round_no + 1, model, e)
         if time.monotonic() > deadline:
