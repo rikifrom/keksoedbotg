@@ -54,8 +54,9 @@ chat_history = defaultdict(lambda: deque(maxlen=HISTORY_SIZE))
 BOT_LABEL = "Ты (бот)"
 
 
-async def ask_gemini(prompt: str):
+async def ask_gemini(contents):
     """Пробует модели по очереди, до 3 кругов (перегрузка 503 обычно временная).
+    contents может быть строкой или списком частей (текст + картинка/аудио/видео).
     Возвращает текст или None, если ничего не сработало за ~45 секунд."""
     deadline = time.monotonic() + 45
     for round_no in range(3):
@@ -67,10 +68,10 @@ async def ask_gemini(prompt: str):
                 response = await asyncio.wait_for(
                     client.aio.models.generate_content(
                         model=model,
-                        contents=prompt,
+                        contents=contents,
                         config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
                     ),
-                    timeout=15,
+                    timeout=25,
                 )
                 if response.text:
                     return response.text
@@ -82,6 +83,14 @@ async def ask_gemini(prompt: str):
         await asyncio.sleep(3)
     logging.error("Все модели недоступны: %s", MODELS)
     return None
+
+
+async def download_telegram_file(file_id: str) -> bytes:
+    """Скачивает файл из Telegram по file_id и возвращает его содержимое.
+    Ограничение Bot API: файлы больше 20 МБ скачать нельзя."""
+    tg_file = await bot.get_file(file_id)
+    buf = await bot.download_file(tg_file.file_path)
+    return buf.read()
 
 
 @dp.message(CommandStart())
@@ -98,13 +107,39 @@ async def handle_message(message: Message):
     text = message.text or message.caption or ""
     user = message.from_user
 
+    # Определяем, есть ли медиа: фото, голосовое или видео-кружок
+    media_kind = None  # "photo" | "voice" | "video_note"
+    media_file_id = None
+    media_mime = None
+    if message.photo:
+        media_kind = "photo"
+        media_file_id = message.photo[-1].file_id  # последнее — самое качественное
+        media_mime = "image/jpeg"
+    elif message.voice:
+        media_kind = "voice"
+        media_file_id = message.voice.file_id
+        media_mime = message.voice.mime_type or "audio/ogg"
+    elif message.video_note:
+        media_kind = "video_note"
+        media_file_id = message.video_note.file_id
+        media_mime = "video/mp4"
+
+    media_labels = {
+        "photo": "[фото]",
+        "voice": "[голосовое сообщение]",
+        "video_note": "[видео-кружок]",
+    }
+
     # Запоминаем сообщение в истории чата ещё до проверки на упоминание —
     # так бот "видит" переписку до того, как к нему обратились.
-    if text and user is not None:
+    if (text or media_kind) and user is not None:
         speaker = f"{user.first_name or ''} {user.last_name or ''}".strip() or (
             user.username or "собеседник"
         )
-        chat_history[message.chat.id].append(f"{speaker}: {text}")
+        line = media_labels.get(media_kind, "")
+        if text:
+            line = f"{line} {text}".strip()
+        chat_history[message.chat.id].append(f"{speaker}: {line}")
 
     is_mentioned = f"@{bot_user.username}" in text
     if (
@@ -122,7 +157,7 @@ async def handle_message(message: Message):
             chat_history[message.chat.id].append(f"{BOT_LABEL}: Да брат")
         return
 
-    if not text or user is None:
+    if (not text and not media_kind) or user is None:
         return
 
     # Пасхалка срабатывает и в личке/при упоминании, без обращения к Gemini
@@ -138,20 +173,56 @@ async def handle_message(message: Message):
     history_lines = list(chat_history[message.chat.id])[:-1]
     history_block = "\n".join(history_lines) if history_lines else "(переписки пока не было)"
 
-    prompt_context = (
+    media_descriptions = {
+        "photo": "прислал(а) фото" + (f' с подписью "{text}"' if text else ""),
+        "voice": "прислал(а) голосовое сообщение",
+        "video_note": "прислал(а) видео-кружок",
+    }
+    what_happened = (
+        media_descriptions[media_kind] if media_kind else f'написал(а): "{text}"'
+    )
+
+    prompt_text = (
         f"Вот последние сообщения в чате для контекста (не отвечай на них напрямую, "
         f"они нужны только для понимания разговора):\n"
         f"{history_block}\n\n"
         f"А теперь к тебе обратился собеседник:\n"
         f"- Имя в телеграм: {full_name}\n"
         f"- Юзернейм: @{username}\n"
-        f"- Сообщение: \"{text}\"\n\n"
-        f"Ответь именно на это последнее сообщение, в своём стиле, при необходимости "
-        f"учитывая контекст переписки выше."
+        f"- Собеседник {what_happened}\n\n"
+        f"Ответь именно на это, в своём стиле"
+        + (
+            ", посмотрев/прослушав приложенный файл"
+            if media_kind
+            else ""
+        )
+        + ", при необходимости учитывая контекст переписки выше."
     )
 
-    await bot.send_chat_action(message.chat.id, "typing")
-    reply_text = await ask_gemini(prompt_context)
+    contents = prompt_text
+    media_error = None
+    if media_kind:
+        try:
+            file_bytes = await download_telegram_file(media_file_id)
+            contents = [
+                types.Part.from_bytes(data=file_bytes, mime_type=media_mime),
+                prompt_text,
+            ]
+        except Exception as e:
+            logging.warning("Не удалось скачать %s: %s", media_kind, e)
+            media_error = e
+
+    action_map = {"photo": "upload_photo", "voice": "record_voice", "video_note": "upload_video"}
+    await bot.send_chat_action(message.chat.id, action_map.get(media_kind, "typing"))
+
+    if media_kind and media_error is not None:
+        # Файл не скачался (например, больше 20 МБ) — отвечаем без него,
+        # но честно сообщаем модели, что содержимое недоступно.
+        reply_text = await ask_gemini(
+            prompt_text + "\n\n(Файл не удалось загрузить, отреагируй на это в своём стиле.)"
+        )
+    else:
+        reply_text = await ask_gemini(contents)
     # message.reply вместо message.answer, чтобы в Telegram было видно цитату
     # сообщения, на которое отвечает бот — особенно важно в группах.
     if reply_text:
